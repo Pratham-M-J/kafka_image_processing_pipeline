@@ -6,30 +6,32 @@ import sys
 
 class ConsumerClient:
     """
-    An intelligent consumer for the YAK message broker.
+    An intelligent consumer compatible with the new broker scripts.
 
     This client:
     1.  Maintains a list of all known broker nodes.
-    2.  Actively discovers the current LEADER by querying /metadata/leader.
-    3.  Tracks its last-read offset locally in a file to ensure "at-least-once"
-        delivery and prevent re-reading all messages.
-    4.  Handles leader failure by catching connection errors, re-running
-        leader discovery, and seamlessly failing over to the new leader.
+    2.  Actively discovers the LEADER by querying /metadata/leader.
+    3.  Tracks its offset locally to ensure "at-least-once" delivery.
+    4.  Handles leader failure by re-running leader discovery.
     """
-    def __init__(self, broker_list, offset_file='consumer_offset.txt'):
+    def __init__(self, broker_list, offset_file='consumer_offset.txt', messages_file='consumed_messages.txt'):
         """
         Initializes the consumer.
 
         Args:
             broker_list (list): A list of base URLs for all known brokers
-                                (e.g., ['http://127.0.0.1:8000', 'http://127.0.0.1:8001'])
             offset_file (str): The local file to persist the last-read offset.
+            messages_file (str): The local file to append received messages to.
         """
         self.brokers = broker_list
         self.offset_file = offset_file
+        self.messages_file = messages_file
         self.current_leader = None
-        self.offset = 0
+        self.offset = 0 # <-- CHANGED: Default offset is 0
         self.session = requests.Session() # Use a session for connection pooling
+        
+        # Consumer will now persist its state between runs.
+        # To reset, manually delete consumer_offset.txt and consumed_messages.txt
 
     def load_offset(self):
         """
@@ -43,59 +45,78 @@ class ConsumerClient:
                     print(f"Loaded offset: {self.offset}")
             except (IOError, ValueError) as e:
                 print(f"Warning: Could not read offset file: {e}. Starting from 0.")
-                self.offset = 0
+                self.offset = 0 # <-- CHANGED: Default offset is 0
         else:
             print("No offset file found. Starting from offset 0.")
-            self.offset = 0
+            self.offset = 0 # <-- CHANGED: Default offset is 0
 
     def save_offset(self):
         """Saves the current offset to the local file."""
         try:
             with open(self.offset_file, 'w') as f:
+                # self.offset already holds the *next* offset to read
                 f.write(str(self.offset))
         except IOError as e:
             print(f"FATAL: Could not write offset file: {e}")
-            # In a real system, you might retry or exit
             
     def find_leader(self):
         """
-        Queries the /metadata/leader endpoint on all known brokers
-        to find the current leader.
+        Queries brokers to find the current leader using the two-step
+        discovery logic from the producer.
+        
+        1. Get the leader's unique ID (e.g., "broker-hostname").
+        2. Find the URL for that ID by checking /health on all brokers.
         
         Returns:
             bool: True if a leader was found, False otherwise.
         """
-        print("Attempting to find the leader...")
+        print("Attempting to find leader (2-step discovery)...")
+        
+        # 1. Get the leader's unique ID
+        leader_id = None
         for broker_url in self.brokers:
             try:
-                # As per diagram, /metadata/leader can be queried on any node
                 response = self.session.get(f"{broker_url}/metadata/leader", timeout=3)
-                
                 if response.status_code == 200:
-                    leader_info = response.json()
-                    self.current_leader = leader_info.get('leader_address')
-                    
-                    if self.current_leader:
-                        print(f"Leader found: {self.current_leader}")
-                        return True
-                    else:
-                        print(f"Error: {broker_url} responded but did not provide a leader address.")
-                        
-            except requests.exceptions.ConnectionError:
-                print(f"Broker at {broker_url} is unreachable.")
-            except requests.exceptions.Timeout:
-                print(f"Request to {broker_url} timed out.")
+                    leader_id = response.json().get("leader_id")
+                    if leader_id:
+                        print(f"Any broker ({broker_url}) reports leader ID is: {leader_id}")
+                        break # Found the ID, can stop asking
+                else:
+                    # This handles 404 "No leader elected"
+                    print(f"Broker {broker_url} responded {response.status_code} to /metadata/leader")
             except requests.exceptions.RequestException as e:
-                print(f"An error occurred while contacting {broker_url}: {e}")
+                print(f"Could not contact {broker_url} for leader ID: {e}")
         
-        print("Could not find a leader after checking all brokers.")
+        if not leader_id:
+            print("Could not find leader ID from any broker.")
+            self.current_leader = None
+            return False
+            
+        # 2. Find the URL for that leader ID
+        for broker_url in self.brokers:
+            try:
+                response = self.session.get(f"{broker_url}/health", timeout=3)
+                if response.status_code == 200:
+                    broker_id = response.json().get("broker_id")
+                    # Check if this broker's ID matches the leader's ID
+                    if broker_id == leader_id:
+                        print(f"Leader {leader_id} found at URL: {broker_url}")
+                        self.current_leader = broker_url
+                        return True
+                else:
+                    print(f"Broker {broker_url} responded {response.status_code} to /health")
+            except requests.exceptions.RequestException as e:
+                print(f"Could not contact {broker_url} for /health check: {e}")
+
+        print(f"Found leader ID {leader_id}, but could not find matching broker URL.")
         self.current_leader = None
         return False
 
     def consume_messages(self):
         """
         Attempts to consume a batch of messages from the current leader.
-        Handles leader failure by setting self.current_leader to None.
+        This is compatible with the new broker's /consume endpoint.
         """
         if not self.current_leader:
             print("No leader known. Attempting to find one.")
@@ -104,7 +125,6 @@ class ConsumerClient:
                 return
 
         try:
-            # Step 6: GET /consume
             # We send our current offset to tell the broker where we are.
             print(f"Consuming from {self.current_leader} starting at offset {self.offset}...")
             response = self.session.get(
@@ -114,7 +134,6 @@ class ConsumerClient:
             )
 
             if response.status_code == 200:
-                # Broker should return messages *at or below* the High Water Mark
                 data = response.json()
                 messages = data.get('messages', [])
                 
@@ -123,24 +142,59 @@ class ConsumerClient:
                     return
 
                 print(f"Received {len(messages)} message(s):")
-                last_offset = -1
-                for msg in messages:
-                    print(f"  > Offset {msg['offset']}: {msg['data']}")
-                    last_offset = msg['offset']
                 
-                # IMPORTANT: Update our offset to the *next* one we
-                # expect to read.
-                self.offset = last_offset + 1
-                self.save_offset()
+                processed_at_least_one = False
+                
+                try:
+                    # Open in 'a' (append) mode
+                    with open(self.messages_file, 'a', encoding='utf-8') as f:
+                        for msg in messages:
+                            if msg['offset'] == self.offset:
+                                # This is the exact message we're waiting for
+                                
+                                # Check if the 'data' field exists and is not empty
+                                message_content = msg.get('data')
+                                if not message_content: 
+                                    print(f"  > Received message at offset {self.offset} but it was blank. Ignoring and retrying.")
+                                    # We break here to retry getting the same offset.
+                                    # This will "stick" at this offset until a
+                                    # non-blank message is received.
+                                    break 
+                                
+                                # If we are here, the message is valid
+                                print(f"  > Offset {msg['offset']}: {message_content}")
+                                f.write(json.dumps(msg) + "\n")
+                                
+                                # Increment self.offset to look for the *next* one
+                                self.offset += 1 
+                                processed_at_least_one = True
+                            
+                            elif msg['offset'] > self.offset:
+                                # We received a future offset. This means the one
+                                # we wanted was skipped (e.g., replication failed).
+                                # We will STOP processing this batch and ask again
+                                # for self.offset (which hasn't changed).
+                                print(f"  > Received offset {msg['offset']}, but was waiting for {self.offset}. Stopping batch to retry.")
+                                break # Stop processing this batch
+                            
+                            # else: msg['offset'] < self.offset
+                            # This shouldn't happen, but we ignore it if it does.
+
+                    # After the loop, if we processed any messages, save our new offset
+                    if processed_at_least_one:
+                        self.save_offset() # save_offset() writes the new self.offset
+
+                except IOError as e:
+                    print(f"FATAL: Could not write to messages file {self.messages_file}: {e}")
                 
             elif 400 <= response.status_code < 500:
-                # Handle application errors, e.g., "Not the Leader"
+                # This handles "Not the leader" or "Invalid offset"
                 print(f"Received error from broker: {response.status_code} {response.text}")
                 print("Assuming leader has changed. Re-discovering...")
                 self.current_leader = None # Force leader re-discovery
                 
             else:
-                # Handle server errors
+                # Handle server errors (500, etc.)
                 print(f"Server error at {self.current_leader}: {response.status_code}")
                 print("Assuming leader failure. Re-discovering...")
                 self.current_leader = None # Force leader re-discovery
@@ -159,11 +213,8 @@ class ConsumerClient:
     def run(self):
         """
         Main run loop for the consumer.
-        
-        Loads offset, finds leader, and enters an infinite loop
-        to poll for messages.
         """
-        self.load_offset()
+        self.load_offset() # Load offset from file (or set to 0)
         self.find_leader() # Find initial leader
         
         print("\nStarting consumer poll loop... (Press Ctrl+C to stop)")
@@ -176,53 +227,20 @@ class ConsumerClient:
             print("\nShutting down consumer.")
             sys.exit(0)
 
-# --- Main execution ---
 if __name__ == "__main__":
     
-    # !!! IMPORTANT !!!
-    # --- [ CHANGE 1: BROKER ADDRESSES ] ---
-    # You MUST change these IP addresses and ports to match your
-    # System 1 (Leader) and System 2 (Follower) network addresses.
-    #
-    # Example for local testing (default):
-    # BROKER_NODES = [
-    #     'http://127.0.0.1:8000',  # System 1 (Initial Leader)
-    #     'http://127.0.0.1:8001'   # System 2 (Initial Follower)
-    # ]
-    #
-    # Example for a real network setup:
-    # BROKER_NODES = [
-    #     'http://192.168.1.101:8000',  # System 1 (Initial Leader)
-    #     'http://192.168.1.102:8000'   # System 2 (Initial Follower)
-    # ]
+    # Make sure these match the IPs and Ports of your two broker scripts
     BROKER_NODES = [
-        'http://127.0.0.1:8000',  # <-- CHANGE THIS
-        'http://127.0.0.1:8001'   # <-- CHANGE THIS
+        'http://192.168.191.152:5001', # Your original leader
+        'http://192.168.191.242:5002'  # Your new follower
     ]
-    # --- [ END OF CHANGE 1 ] ---
     
-    
-    # You can change this to the IP of your System 4 (this machine) if needed
-    # for logging, but it's not required for functionality.
-    print("Starting YAK Consumer Client (System 4)")
+    print("Starting YAK Consumer Client")
 
-    # --- [ CHANGE 2: OFFSET FILE PATH (Optional) ] ---
-    # This is the local file where the consumer saves its progress (the
-    # last-read offset). By default, it saves 'consumer_offset.txt'
-    # in the same directory.
-    # You can change this to an absolute path if you prefer.
-    #
-    # Example:
-    # consumer = ConsumerClient(
-    #     broker_list=BROKER_NODES,
-    #     offset_file='/home/user/yak_progress.txt'
-    # )
     consumer = ConsumerClient(
         broker_list=BROKER_NODES,
-        offset_file='consumer_offset.txt' # <-- (Optional) CHANGE THIS
+        offset_file='consumer_offset.txt',
+        messages_file='consumed_messages.txt'
     )
-    # --- [ END OF CHANGE 2 ] ---
     
     consumer.run()
-
-
